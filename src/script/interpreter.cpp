@@ -417,6 +417,80 @@ static bool EvalChecksig(const valtype& sig, const valtype& pubkey, CScript::con
     assert(false);
 }
 
+static constexpr size_t HashOpcodeDigestLen(opcodetype opcode)
+{
+    switch (opcode) {
+    case OP_RIPEMD160:
+    case OP_SHA1:
+    case OP_HASH160:
+        return 20;
+    case OP_SHA256:
+    case OP_HASH256:
+        return 32;
+    default:
+        break;
+    }
+    assert(false);
+}
+
+static void ComputeHashOpcode(opcodetype opcode, const valtype& data, valtype& hash_out)
+{
+    if (opcode == OP_RIPEMD160)
+        CRIPEMD160().Write(data.data(), data.size()).Finalize(hash_out.data());
+    else if (opcode == OP_SHA1)
+        CSHA1().Write(data.data(), data.size()).Finalize(hash_out.data());
+    else if (opcode == OP_SHA256)
+        CSHA256().Write(data.data(), data.size()).Finalize(hash_out.data());
+    else if (opcode == OP_HASH160)
+        CHash160().Write(data).Finalize(hash_out);
+    else if (opcode == OP_HASH256)
+        CHash256().Write(data).Finalize(hash_out);
+}
+
+/** Minimum preimage size for which a hash opcode result is cached. Elements smaller than this
+ *  do not touch the hash cache because it bounds the cache to elements whose bytes the
+ *  transaction already paid for. Overridable at build time to measure with the cache
+ *  disabled, -DSCRIPT_HASH_CACHE_MIN_PREIMAGE_SIZE=SIZE_MAX. */
+#ifndef SCRIPT_HASH_CACHE_MIN_PREIMAGE_SIZE
+#define SCRIPT_HASH_CACHE_MIN_PREIMAGE_SIZE (128)
+#endif
+
+std::vector<unsigned char> ScriptHashCache::Apply(opcodetype opcode, const ScriptStackElem& elem)
+{
+    size_t digest_len = HashOpcodeDigestLen(opcode);
+    assert(digest_len > 0);
+    valtype digest(digest_len);
+
+    if (elem->size() < SCRIPT_HASH_CACHE_MIN_PREIMAGE_SIZE) {
+        ComputeHashOpcode(opcode, *elem, digest);
+        return digest;
+    }
+
+    // Cache hit
+    auto it = m_entries.find(elem.get());
+    if (it != m_entries.end()) {
+        auto hit = it->second.hashes.find(opcode);
+        if (hit != it->second.hashes.end()) {
+            digest = hit->second;
+        } else {
+            ComputeHashOpcode(opcode, *elem, digest);
+            it->second.hashes.emplace(opcode, digest);
+        }
+        return digest;
+    }
+
+    // Cache miss
+    ComputeHashOpcode(opcode, *elem, digest);
+
+    // We assume the stack element to hash is top of the stack, and about to be popped,
+    // so we ought only to insert an entry into the cache if there exists at least one
+    // other reference elsewhere in the stack that might be hashed later.
+    if (elem.use_count() > 1) {
+        m_entries.emplace(elem.get(), ScriptHashCacheEntry{elem, {{opcode, digest}}});
+    }
+    return digest;
+}
+
 bool EvalScript(std::vector<ScriptStackElem>& stack, const CScript& script, script_verify_flags flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptExecutionData* execdata_ptr, ScriptError* serror)
 {
     ScriptExecutionData default_execdata;
@@ -442,6 +516,7 @@ bool EvalScript(std::vector<ScriptStackElem>& stack, const CScript& script, scri
     valtype vchPushValue;
     ConditionStack vfExec;
     std::vector<ScriptStackElem> altstack;
+    ScriptHashCache hash_cache;
     set_error(serror, SCRIPT_ERR_UNKNOWN_ERROR);
     if ((sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0) && script.size() > MAX_SCRIPT_SIZE) {
         return set_error(serror, SCRIPT_ERR_SCRIPT_SIZE);
@@ -1046,18 +1121,7 @@ bool EvalScript(std::vector<ScriptStackElem>& stack, const CScript& script, scri
                     // (in -- hash)
                     if (stack.size() < 1)
                         return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
-                    const valtype& vch = stacktop(-1);
-                    valtype vchHash((opcode == OP_RIPEMD160 || opcode == OP_SHA1 || opcode == OP_HASH160) ? 20 : 32);
-                    if (opcode == OP_RIPEMD160)
-                        CRIPEMD160().Write(vch.data(), vch.size()).Finalize(vchHash.data());
-                    else if (opcode == OP_SHA1)
-                        CSHA1().Write(vch.data(), vch.size()).Finalize(vchHash.data());
-                    else if (opcode == OP_SHA256)
-                        CSHA256().Write(vch.data(), vch.size()).Finalize(vchHash.data());
-                    else if (opcode == OP_HASH160)
-                        CHash160().Write(vch).Finalize(vchHash);
-                    else if (opcode == OP_HASH256)
-                        CHash256().Write(vch).Finalize(vchHash);
+                    valtype vchHash = hash_cache.Apply(opcode, stackelem(-1));
                     popstack(stack);
                     stack.push_back(MakeStackElem(std::move(vchHash)));
                 }

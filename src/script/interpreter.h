@@ -382,6 +382,26 @@ using ScriptStackElem = std::shared_ptr<const std::vector<unsigned char>>;
 /** Wrap bytes as a script stack element. */
 ScriptStackElem MakeStackElem(std::vector<unsigned char>&& v);
 
+/** Per-script-execution cache of hash-opcode results, keyed by stack element identity (see
+ *  ScriptStackElem). Entries pin their element so the address used as a key stays unique. */
+class ScriptHashCache
+{
+public:
+    /** Return the digest of elem as opcode would produce it (OP_SHA256/OP_HASH256/OP_RIPEMD160/
+     *  OP_HASH160/OP_SHA1), using the cache when it is (or may become) worth it. Requires: opcode
+     *  is one of those five, and elem refers to a live stack element, because whether to cache is
+     *  decided from its reference count. */
+    std::vector<unsigned char> Apply(opcodetype opcode, const ScriptStackElem& elem);
+
+private:
+    struct ScriptHashCacheEntry {
+        ScriptStackElem elem; //!< Pins the element: keeps key unique.
+        std::map<opcodetype, std::vector<unsigned char>> hashes;
+    };
+
+    std::map<const std::vector<unsigned char>*, ScriptHashCacheEntry> m_entries;
+};
+
 bool EvalScript(std::vector<ScriptStackElem>& stack, const CScript& script, script_verify_flags flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptExecutionData* execdata = nullptr, ScriptError* error = nullptr);
 bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const CScriptWitness* witness, script_verify_flags flags, const BaseSignatureChecker& checker, ScriptError* serror = nullptr);
 
