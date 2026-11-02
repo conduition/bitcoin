@@ -5,6 +5,10 @@
 #include <common/system.h>
 #include <compressor.h>
 #include <core_io.h>
+#include <crypto/ripemd160.h>
+#include <crypto/sha1.h>
+#include <crypto/sha256.h>
+#include <hash.h>
 #include <key.h>
 #include <rpc/util.h>
 #include <script/interpreter.h>
@@ -23,6 +27,7 @@
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
 #include <test/util/transaction_utils.h>
+#include <uint256.h>
 #include <univalue.h>
 #include <util/check.h>
 #include <util/fs.h>
@@ -1290,6 +1295,319 @@ BOOST_AUTO_TEST_CASE(eval_script_stack_aliasing)
         BOOST_CHECK(EvalOn(stack, CScript() << OP_DROP));
         BOOST_CHECK(stack.empty());
         BOOST_CHECK(weak.expired()); // nothing outside the stack ever owned it
+    }
+}
+
+namespace {
+// Reference digests, to test against the interpreter's hash cache.
+std::vector<unsigned char> RefRIPEMD160(const std::vector<unsigned char>& data)
+{
+    std::vector<unsigned char> out(CRIPEMD160::OUTPUT_SIZE);
+    CRIPEMD160().Write(data.data(), data.size()).Finalize(out.data());
+    return out;
+}
+
+std::vector<unsigned char> RefSHA1(const std::vector<unsigned char>& data)
+{
+    std::vector<unsigned char> out(CSHA1::OUTPUT_SIZE);
+    CSHA1().Write(data.data(), data.size()).Finalize(out.data());
+    return out;
+}
+
+std::vector<unsigned char> RefSHA256(const std::vector<unsigned char>& data)
+{
+    std::vector<unsigned char> out(CSHA256::OUTPUT_SIZE);
+    CSHA256().Write(data.data(), data.size()).Finalize(out.data());
+    return out;
+}
+
+std::vector<unsigned char> RefHash160(const std::vector<unsigned char>& data)
+{
+    std::vector<unsigned char> out(CRIPEMD160::OUTPUT_SIZE);
+    CHash160().Write(data).Finalize(out);
+    return out;
+}
+
+std::vector<unsigned char> RefHash256(const std::vector<unsigned char>& data)
+{
+    std::vector<unsigned char> out(CSHA256::OUTPUT_SIZE);
+    CHash256().Write(data).Finalize(out);
+    return out;
+}
+
+std::vector<unsigned char> RefDigest(opcodetype opcode, const std::vector<unsigned char>& data)
+{
+    switch (opcode) {
+    case OP_RIPEMD160: return RefRIPEMD160(data);
+    case OP_SHA1: return RefSHA1(data);
+    case OP_HASH160: return RefHash160(data);
+    case OP_SHA256: return RefSHA256(data);
+    case OP_HASH256: return RefHash256(data);
+    default: break;
+    }
+    BOOST_FAIL(strprintf("not a hash opcode: %d", opcode));
+    return {};
+}
+
+struct HashOpcodeCase {
+    opcodetype opcode;
+    size_t digest_len;
+};
+
+/** The five hash opcodes, each listed twice in a row. Applying them in order to the
+ *  same stack element, the first use of an opcode compute the hash, and the second
+ *  op hits the cache. */
+constexpr HashOpcodeCase HASH_OPCODE_CASES[] = {
+    {OP_SHA256, CSHA256::OUTPUT_SIZE},
+    {OP_SHA256, CSHA256::OUTPUT_SIZE},
+    {OP_HASH256, CSHA256::OUTPUT_SIZE},
+    {OP_HASH256, CSHA256::OUTPUT_SIZE},
+    {OP_RIPEMD160, CRIPEMD160::OUTPUT_SIZE},
+    {OP_RIPEMD160, CRIPEMD160::OUTPUT_SIZE},
+    {OP_HASH160, CRIPEMD160::OUTPUT_SIZE},
+    {OP_HASH160, CRIPEMD160::OUTPUT_SIZE},
+    {OP_SHA1, CSHA1::OUTPUT_SIZE},
+    {OP_SHA1, CSHA1::OUTPUT_SIZE},
+};
+constexpr size_t NUM_HASH_OPCODE_CASES = sizeof(HASH_OPCODE_CASES) / sizeof(HASH_OPCODE_CASES[0]);
+
+//! A SIGHASH_ALL signature over input 0 of tx_to, over script_code at sigversion.
+std::vector<unsigned char> SignInput(const CKey& key, const CScript& script_code, const CMutableTransaction& tx_to, CAmount amount, SigVersion sigversion)
+{
+    const uint256 sighash = SignatureHash(script_code, tx_to, 0, SIGHASH_ALL, amount, sigversion);
+    std::vector<unsigned char> sig;
+    BOOST_REQUIRE(key.Sign(sighash, sig));
+    sig.push_back(static_cast<unsigned char>(SIGHASH_ALL));
+    return sig;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(script_hash_cache)
+{
+    // at/below the sighash cache threshold (128 bytes)
+    const std::vector<unsigned char> below(127, 0x11);
+    const std::vector<unsigned char> at(128, 0x22);
+    const std::vector<unsigned char> large(512, 0x33);
+    const std::vector<unsigned char> other(512, 0x34);
+
+    {
+        // Below the caching threshold nothing is cached: h and duplicate stay the only two owners across both calls.
+        ScriptHashCache cache;
+        const ScriptStackElem h = MakeStackElem(std::vector<unsigned char>(below));
+        const ScriptStackElem duplicate = h;
+        BOOST_CHECK_EQUAL(HexStr(cache.Apply(OP_SHA256, duplicate)), HexStr(RefSHA256(below)));
+        BOOST_CHECK_EQUAL(duplicate.use_count(), 2);
+        BOOST_CHECK_EQUAL(HexStr(cache.Apply(OP_HASH256, duplicate)), HexStr(RefHash256(below)));
+        BOOST_CHECK_EQUAL(duplicate.use_count(), 2);
+    }
+    {
+        // Exactly at the threshold the element is inserted into the cache.
+        // The handle inserted into the cache is the new third reference owner.
+        ScriptHashCache cache;
+        const ScriptStackElem h = MakeStackElem(std::vector<unsigned char>(at));
+        const ScriptStackElem duplicate = h;
+        BOOST_CHECK_EQUAL(HexStr(cache.Apply(OP_SHA256, duplicate)), HexStr(RefSHA256(at)));
+        BOOST_CHECK_EQUAL(duplicate.use_count(), 3);
+    }
+    {
+        // Hashing a single stack element with all five opcodes, confirming that the cache misses and hits
+        // both return the correct value, and that the cache pins each input.
+        ScriptHashCache cache;
+        const ScriptStackElem h = MakeStackElem(std::vector<unsigned char>(large));
+        const ScriptStackElem duplicate = h;
+        for (const HashOpcodeCase& test_case : HASH_OPCODE_CASES) {
+            const std::vector<unsigned char> digest = cache.Apply(test_case.opcode, duplicate);
+            BOOST_CHECK_EQUAL(digest.size(), test_case.digest_len);
+            BOOST_CHECK_EQUAL(HexStr(digest), HexStr(RefDigest(test_case.opcode, large)));
+            BOOST_CHECK_EQUAL(duplicate.use_count(), 3);
+        }
+    }
+    {
+        // Below the threshold the same five opcodes are all still correct, and nothing is ever pinned
+        // by the cache.
+        ScriptHashCache cache;
+        const ScriptStackElem h = MakeStackElem(std::vector<unsigned char>(below));
+        const ScriptStackElem duplicate = h;
+        for (const HashOpcodeCase& test_case : HASH_OPCODE_CASES) {
+            BOOST_CHECK_EQUAL(HexStr(cache.Apply(test_case.opcode, duplicate)), HexStr(RefDigest(test_case.opcode, below)));
+            BOOST_CHECK_EQUAL(duplicate.use_count(), 2);
+        }
+    }
+    {
+        // Two live elements of equal size hash independently through one cache, keys do not collide.
+        ScriptHashCache cache;
+        const ScriptStackElem h1 = MakeStackElem(std::vector<unsigned char>(large));
+        const ScriptStackElem duplicate1 = h1;
+        const ScriptStackElem h2 = MakeStackElem(std::vector<unsigned char>(other));
+        const ScriptStackElem duplicate2 = h2;
+        BOOST_CHECK(duplicate1.get() != duplicate2.get());
+        BOOST_CHECK_EQUAL(HexStr(cache.Apply(OP_SHA256, duplicate1)), HexStr(RefSHA256(large)));
+        BOOST_CHECK_EQUAL(HexStr(cache.Apply(OP_SHA256, duplicate2)), HexStr(RefSHA256(other)));
+        BOOST_CHECK_EQUAL(HexStr(cache.Apply(OP_SHA256, duplicate1)), HexStr(RefSHA256(large)));
+        BOOST_CHECK_EQUAL(HexStr(cache.Apply(OP_SHA256, duplicate2)), HexStr(RefSHA256(other)));
+    }
+    {
+        // A cache entry holds a reference to its key's stack element. When both test handles
+        // are gone the cache's pin is the only reference owner. The element's pin survives for
+        // as long as the cache does.
+        std::weak_ptr<const std::vector<unsigned char>> weak;
+        {
+            ScriptHashCache cache;
+            {
+                const ScriptStackElem h = MakeStackElem(std::vector<unsigned char>(large));
+                weak = h;
+                const ScriptStackElem duplicate = h;
+                BOOST_CHECK_EQUAL(HexStr(cache.Apply(OP_SHA256, duplicate)), HexStr(RefSHA256(large)));
+            }
+            BOOST_CHECK(!weak.expired());
+        }
+        BOOST_CHECK(weak.expired());
+    }
+    {
+        // Dropping/popping an element from the stack decrements its ref count. This should not affect
+        // a pre-existing hash cache entry.
+        ScriptHashCache cache;
+        ScriptStackElem h = MakeStackElem(std::vector<unsigned char>(large));
+        const ScriptStackElem duplicate = h;
+        BOOST_CHECK_EQUAL(HexStr(cache.Apply(OP_SHA256, duplicate)), HexStr(RefSHA256(large)));
+        BOOST_REQUIRE_EQUAL(duplicate.use_count(), 3);
+        h.reset();
+        BOOST_CHECK_EQUAL(duplicate.use_count(), 2);
+        BOOST_CHECK_EQUAL(HexStr(cache.Apply(OP_SHA256, duplicate)), HexStr(RefSHA256(large)));
+        BOOST_CHECK_EQUAL(duplicate.use_count(), 2);
+        BOOST_CHECK_EQUAL(HexStr(cache.Apply(OP_SHA256, duplicate)), HexStr(RefSHA256(large)));
+        BOOST_CHECK_EQUAL(duplicate.use_count(), 2);
+    }
+    {
+        // A lone stack element is hashed without an existing entry and with no other references
+        // on the stack. nothing else holds a reference to that element, so we shouldn't cache it.
+        ScriptHashCache cache;
+        const ScriptStackElem elem = MakeStackElem(std::vector<unsigned char>(large));
+        BOOST_CHECK_EQUAL(HexStr(cache.Apply(OP_SHA256, elem)), HexStr(RefSHA256(large)));
+        BOOST_CHECK_EQUAL(elem.use_count(), 1);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(eval_script_hash_cache)
+{
+    // MAX_SCRIPT_ELEMENT_SIZE is the largest preimage any script can push, so it is the largest the cache
+    // can ever see.
+    const std::vector<unsigned char> x(MAX_SCRIPT_ELEMENT_SIZE, 0xab);
+    const std::vector<unsigned char> y(MAX_SCRIPT_ELEMENT_SIZE, 0xac);
+    const std::vector<unsigned char> loop_a(MAX_SCRIPT_ELEMENT_SIZE, 0xad);
+    const std::vector<unsigned char> loop_b(MAX_SCRIPT_ELEMENT_SIZE, 0xae);
+
+    // Convenience wrapper around EvalScript for testing.
+    const auto EvalOk = [](std::vector<ScriptStackElem>& stack, const CScript& script) {
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        const bool ret = EvalScript(stack, script, SCRIPT_VERIFY_NONE, BaseSignatureChecker(), SigVersion::BASE, nullptr, &err);
+        BOOST_CHECK_MESSAGE(ret, FormatScriptError(err));
+        BOOST_CHECK(ret && err == SCRIPT_ERR_OK);
+    };
+
+    {
+        // Three copies of an element hashed one after another: the first hash inserts a cache entry
+        // and the later ones hit it.
+        std::vector<ScriptStackElem> stack;
+        EvalOk(stack, CScript() << x << OP_DUP << OP_TOALTSTACK << OP_DUP << OP_SHA256
+                                << OP_FROMALTSTACK << OP_SHA256 << OP_ROT << OP_SHA256);
+        BOOST_REQUIRE(stack.size() == 3);
+        BOOST_CHECK_EQUAL(HexStr(*stack[0]), HexStr(RefSHA256(x)));
+        BOOST_CHECK_EQUAL(HexStr(*stack[1]), HexStr(RefSHA256(x)));
+        BOOST_CHECK_EQUAL(HexStr(*stack[2]), HexStr(RefSHA256(x)));
+    }
+    {
+        // Each of the five hash opcodes applied twice to one aliased element.
+        // TODO: fix this shit
+        CScript script = CScript() << x;
+        for (size_t i = 1; i < NUM_HASH_OPCODE_CASES; ++i) {
+            script << OP_DUP << OP_TOALTSTACK;
+        }
+        for (size_t i = 0; i < NUM_HASH_OPCODE_CASES; ++i) {
+            script << HASH_OPCODE_CASES[i].opcode;
+            if (i + 1 < NUM_HASH_OPCODE_CASES) script << OP_FROMALTSTACK;
+        }
+        std::vector<ScriptStackElem> stack;
+        EvalOk(stack, script);
+        BOOST_REQUIRE(stack.size() == NUM_HASH_OPCODE_CASES);
+        for (size_t i = 0; i < NUM_HASH_OPCODE_CASES; ++i) {
+            BOOST_CHECK_EQUAL(stack[i]->size(), HASH_OPCODE_CASES[i].digest_len);
+            BOOST_CHECK_EQUAL(HexStr(*stack[i]), HexStr(RefDigest(HASH_OPCODE_CASES[i].opcode, x)));
+        }
+    }
+    {
+        // End-to-end companion to the unit-level pinning assertions, and a test for a missing pin.
+        // In a correct build `x` stays pinned by its entry to the end of the execution, so its
+        // address is never freed and never reused. Without the pin `x` is the last one freed
+        // before `y` is pushed, both elements are hashed with the same opcode so a stale entry
+        // could be read, and `<y> OP_SHA256` would push the digest of `x` instead. That reuse
+        // depends on the allocator handing back the address just freed (undefined), so the
+        // unit-level assertions stay the primary guard.
+        std::vector<ScriptStackElem> stack;
+        EvalOk(stack, CScript() << x << OP_DUP << OP_SHA256 << OP_SWAP << OP_DROP
+                                << y << OP_DUP << OP_SHA256);
+        BOOST_REQUIRE(stack.size() == 3);
+        BOOST_CHECK_EQUAL(HexStr(*stack[0]), HexStr(RefSHA256(x)));
+        BOOST_CHECK_EQUAL(HexStr(*stack[1]), HexStr(y));
+        BOOST_CHECK_EQUAL(HexStr(*stack[2]), HexStr(RefSHA256(y)));
+    }
+    {
+        // A hashing script run 200 times over with alternating preimages.
+        // Each run tests for a cache miss-then-hit scenario, with an empty cache each time.
+        for (int i = 0; i < 200; ++i) {
+            const std::vector<unsigned char>& src = (i % 2) ? loop_a : loop_b;
+            std::vector<ScriptStackElem> stack;
+            EvalOk(stack, CScript() << src << OP_DUP << OP_SHA256 << OP_SWAP << OP_SHA256);
+            BOOST_REQUIRE(stack.size() == 2);
+            BOOST_CHECK_EQUAL(HexStr(*stack[0]), HexStr(RefSHA256(src)));
+            BOOST_CHECK_EQUAL(HexStr(*stack[1]), HexStr(RefSHA256(src)));
+        }
+    }
+    {
+        // P2SH end to end. The redeemScript hashes a pushed element once, so its entry is created while
+        // VerifyScript's copy of the scriptSig stack still holds the only other reference to it.
+        const std::vector<unsigned char> elem(MAX_SCRIPT_ELEMENT_SIZE, 0xaf);
+        const CAmount amount = 1;
+        const CKey key = GenerateRandomKey();
+        const CScript redeem = CScript() << std::vector<unsigned char>(128, 0x21) << OP_DROP << OP_DUP << OP_SHA256
+                                         << RefSHA256(elem) << OP_EQUALVERIFY << OP_DROP
+                                         << ToByteVector(key.GetPubKey()) << OP_CHECKSIG;
+        const CScript script_pubkey = CScript() << OP_HASH160 << ToByteVector(CScriptID(redeem)) << OP_EQUAL;
+        const CTransaction credit{BuildCreditingTransaction(script_pubkey, amount)};
+        CMutableTransaction spend{BuildSpendingTransaction(CScript(), CScriptWitness(), credit)};
+        CScript script_sig;
+        script_sig << SignInput(key, redeem, spend, amount, SigVersion::BASE) << elem
+                   << std::vector<unsigned char>(redeem.begin(), redeem.end());
+        spend.vin[0].scriptSig = script_sig;
+        const script_verify_flags flags = SCRIPT_VERIFY_P2SH;
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(VerifyScript(script_sig, script_pubkey, /*witness=*/nullptr, flags,
+                                 MutableTransactionSignatureChecker(&spend, /*nIn=*/0, amount, MissingDataBehavior::ASSERT_FAIL), &err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+    }
+    {
+        // P2WSH end to end, with the same script shape carried in the witness.
+        const std::vector<unsigned char> elem(MAX_SCRIPT_ELEMENT_SIZE, 0xbe);
+        const CAmount amount = 1;
+        const CKey key = GenerateRandomKey();
+        const CScript witscript = CScript() << std::vector<unsigned char>(128, 0x21) << OP_DROP << OP_DUP << OP_SHA256
+                                            << RefSHA256(elem) << OP_EQUALVERIFY << OP_DROP
+                                            << ToByteVector(key.GetPubKey()) << OP_CHECKSIG;
+        uint256 script_hash;
+        CSHA256().Write(witscript.data(), witscript.size()).Finalize(script_hash.begin());
+        const CScript script_pubkey = CScript() << OP_0 << ToByteVector(script_hash);
+        const CTransaction credit{BuildCreditingTransaction(script_pubkey, amount)};
+        CMutableTransaction spend{BuildSpendingTransaction(CScript(), CScriptWitness(), credit)};
+        CScriptWitness witness;
+        witness.stack.push_back(SignInput(key, witscript, spend, amount, SigVersion::WITNESS_V0));
+        witness.stack.push_back(elem);
+        witness.stack.push_back(std::vector<unsigned char>(witscript.begin(), witscript.end()));
+        spend.vin[0].scriptWitness = witness;
+        const script_verify_flags flags = SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS;
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(VerifyScript(CScript(), script_pubkey, &witness, flags,
+                                 MutableTransactionSignatureChecker(&spend, /*nIn=*/0, amount, MissingDataBehavior::ASSERT_FAIL), &err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
     }
 }
 

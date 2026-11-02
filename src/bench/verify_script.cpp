@@ -229,6 +229,121 @@ static void VerifyPushDropSized40(benchmark::Bench& bench) { VerifyPushDropSized
 static void VerifyPushDropSized56(benchmark::Bench& bench) { VerifyPushDropSized<56>(bench); }
 static void VerifyPushDropSized520(benchmark::Bench& bench) { VerifyPushDropSized<520>(bench); }
 
+namespace {
+// One dense hashing opcode cycle is `OP_3DUP + 3 * (HASH OP_DROP)`: 7 bytes, 3 hashes.
+// The hashed element is placed on the stack by the bench, so it costs no script bytes.
+// `OP_DUP OP_DUP` at the beginning of the script primes three copies, so tapscript allows
+//   2 + 7 * cycles <= MAX_SCRIPT_SIZE     ->  1428 cycles, 9998 bytes, 4284 hashes
+// and p2(w)sh allows
+//   2 + 7 * cycles <= MAX_OPS_PER_SCRIPT  ->    28 cycles,  198 opcodes, 84 hashes
+constexpr size_t TAPSCRIPT_HASH_CYCLES = 1428;
+constexpr size_t WITNESS_V0_HASH_CYCLES = 28;
+
+// [DUP DUP (3DUP HASH DROP HASH DROP HASH DROP)...] applied to the single element the setup
+// puts on the stack: the element is hashed three times per cycle and the stack is left as found.
+// Tapscript has no opcode budget, so this is the densest hashing a 10000-byte script can ask for.
+void BenchDenseHashScript(benchmark::Bench& bench, opcodetype opcode, size_t cycles, SigVersion sigversion, size_t elem_size)
+{
+    const std::vector<unsigned char> vch(elem_size, 0xab);
+    CScript script;
+    script << OP_DUP << OP_DUP;
+    for (size_t i = 0; i < cycles; ++i) {
+        script << OP_3DUP;
+        for (int j = 0; j < 3; ++j) {
+            script << opcode << OP_DROP;
+        }
+    }
+
+    std::vector<ScriptStackElem> stack;
+    bench.unit("script")
+        .setup([&] {
+            stack.clear();
+            stack.push_back(MakeStackElem(std::vector<unsigned char>(vch)));
+        })
+        .run([&] {
+            ScriptError error;
+            const bool ret{EvalScript(stack, script, /*flags=*/0, BaseSignatureChecker(), sigversion, nullptr, &error)};
+            assert(ret && error == SCRIPT_ERR_OK);
+        });
+}
+} // namespace
+
+static void VerifyScriptHashLoopSha256(benchmark::Bench& bench)
+{
+    BenchDenseHashScript(bench, OP_SHA256, TAPSCRIPT_HASH_CYCLES, SigVersion::TAPSCRIPT, MAX_SCRIPT_ELEMENT_SIZE);
+}
+
+static void VerifyScriptHashLoopHash256(benchmark::Bench& bench)
+{
+    BenchDenseHashScript(bench, OP_HASH256, TAPSCRIPT_HASH_CYCLES, SigVersion::TAPSCRIPT, MAX_SCRIPT_ELEMENT_SIZE);
+}
+
+static void VerifyScriptHashLoopRipemd160(benchmark::Bench& bench)
+{
+    BenchDenseHashScript(bench, OP_RIPEMD160, TAPSCRIPT_HASH_CYCLES, SigVersion::TAPSCRIPT, MAX_SCRIPT_ELEMENT_SIZE);
+}
+
+static void VerifyScriptHashLoopSha1(benchmark::Bench& bench)
+{
+    BenchDenseHashScript(bench, OP_SHA1, TAPSCRIPT_HASH_CYCLES, SigVersion::TAPSCRIPT, MAX_SCRIPT_ELEMENT_SIZE);
+}
+
+static void VerifyScriptHashLoopHash160(benchmark::Bench& bench)
+{
+    BenchDenseHashScript(bench, OP_HASH160, TAPSCRIPT_HASH_CYCLES, SigVersion::TAPSCRIPT, MAX_SCRIPT_ELEMENT_SIZE);
+}
+
+static void VerifyScriptHashWitnessV0Sha256Looped(benchmark::Bench& bench)
+{
+    BenchDenseHashScript(bench, OP_SHA256, WITNESS_V0_HASH_CYCLES, SigVersion::WITNESS_V0, MAX_SCRIPT_ELEMENT_SIZE);
+}
+
+// The same dense loop on an element below the cache threshold: every hash is a
+// cache miss but cheap to compute directly.
+static void VerifyScriptHashSmall(benchmark::Bench& bench)
+{
+    BenchDenseHashScript(bench, OP_SHA256, TAPSCRIPT_HASH_CYCLES, SigVersion::TAPSCRIPT, 20);
+}
+
+// Distinct elements, each hashed exactly once, so no entry is ever created. This measures what the
+// cache costs when it can never hit. Elements are placed on the stack by the bench, which keeps the
+// reference count of each at one when its hash runs. Uses tapscript, because 1000 hashes is far over
+// MAX_OPS_PER_SCRIPT from P2(W)SH, and 1000 is the most the stack limit allows, since the check is
+// stack.size() + altstack.size() > MAX_STACK_SIZE.
+static void VerifyScriptHashDistinctLarge(benchmark::Bench& bench)
+{
+    constexpr int NUM_ELEMENTS = 1000;
+    CScript script;
+    for (int i = 0; i < NUM_ELEMENTS; ++i) {
+        script << OP_SHA256 << OP_DROP;
+    }
+    std::vector<ScriptStackElem> stack;
+    bench.unit("script")
+        .setup([&] {
+            stack.clear();
+            for (int i = 0; i < NUM_ELEMENTS; ++i) {
+                std::vector<unsigned char> elem(MAX_SCRIPT_ELEMENT_SIZE, 0xab);
+                elem[0] = static_cast<unsigned char>(i);
+                elem[1] = static_cast<unsigned char>(i >> 8);
+                stack.push_back(MakeStackElem(std::move(elem)));
+            }
+        })
+        .run([&] {
+            ScriptError error;
+            const bool ret{EvalScript(stack, script, /*flags=*/0, BaseSignatureChecker(), SigVersion::TAPSCRIPT, nullptr, &error)};
+            assert(ret && error == SCRIPT_ERR_OK);
+            assert(stack.empty());
+        });
+}
+
+BENCHMARK(VerifyScriptHashLoopSha256);
+BENCHMARK(VerifyScriptHashLoopHash256);
+BENCHMARK(VerifyScriptHashLoopRipemd160);
+BENCHMARK(VerifyScriptHashLoopSha1);
+BENCHMARK(VerifyScriptHashLoopHash160);
+BENCHMARK(VerifyScriptHashWitnessV0Sha256Looped);
+BENCHMARK(VerifyScriptHashSmall);
+BENCHMARK(VerifyScriptHashDistinctLarge);
 BENCHMARK(VerifyScriptP2WPKH);
 BENCHMARK(VerifyScriptP2SH_P2WPKH);
 BENCHMARK(VerifyScriptP2TR_KeyPath);
