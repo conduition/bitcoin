@@ -11,10 +11,11 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
-bool CastToBool(const std::vector<unsigned char>& vch);
+bool CastToBool(std::span<const uint8_t> vch);
 
 FUZZ_TARGET(script_interpreter)
 {

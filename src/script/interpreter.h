@@ -11,6 +11,7 @@
 #include <primitives/transaction.h>
 #include <script/script.h>
 #include <script/script_error.h>
+#include <script/stack_elem.h>
 #include <script/verify_flags.h>
 #include <uint256.h>
 
@@ -374,13 +375,6 @@ uint256 ComputeTapbranchHash(std::span<const unsigned char> a, std::span<const u
 /** Compute the BIP341 taproot script tree Merkle root from control block and leaf hash.
  *  Requires control block to have valid length (33 + k*32, with k in {0,1,..,128}). */
 uint256 ComputeTaprootMerkleRoot(std::span<const unsigned char> control, const uint256& tapleaf_hash);
-
-/** A script stack element. Reference-counted so that duplicating a stack item (OP_DUP & friends) copies
- *  the pointer rather than the element's contents. */
-using ScriptStackElem = std::shared_ptr<const std::vector<unsigned char>>;
-
-/** Wrap bytes as a script stack element. */
-ScriptStackElem MakeStackElem(std::vector<unsigned char>&& v);
 
 bool EvalScript(std::vector<ScriptStackElem>& stack, const CScript& script, script_verify_flags flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptExecutionData* execdata = nullptr, ScriptError* error = nullptr);
 bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const CScriptWitness* witness, script_verify_flags flags, const BaseSignatureChecker& checker, ScriptError* serror = nullptr);

@@ -984,7 +984,7 @@ static std::vector<std::vector<unsigned char>> BytesOf(const std::vector<ScriptS
     std::vector<std::vector<unsigned char>> bytes;
     bytes.reserve(stack.size());
     for (const ScriptStackElem& elem : stack) {
-        bytes.push_back(*elem);
+        bytes.emplace_back(elem->begin(), elem->end());
     }
     return bytes;
 }
@@ -1251,7 +1251,6 @@ BOOST_AUTO_TEST_CASE(eval_script_stack_aliasing)
         // OP_DROP releases the pointer it removes from the stack.
         ScriptStackElem elem1 = MakeStackElem(std::vector<unsigned char>(vch1));
         ScriptStackElem elem2 = MakeStackElem(std::vector<unsigned char>(vch2));
-        std::weak_ptr<const std::vector<unsigned char>> weak{elem2};
         std::vector<ScriptStackElem> stack;
         stack.push_back(elem1);
         stack.push_back(elem2);
@@ -1259,16 +1258,14 @@ BOOST_AUTO_TEST_CASE(eval_script_stack_aliasing)
         BOOST_CHECK(EvalOn(stack, CScript() << OP_DROP));
         BOOST_REQUIRE(stack.size() == 1);
         BOOST_CHECK(stack[0].get() == elem1.get());
-        BOOST_CHECK_EQUAL(elem2.use_count(), 1);
-        BOOST_CHECK(!weak.expired()); // alive via the test handle
-        elem2.reset();
-        BOOST_CHECK(weak.expired());
+        BOOST_CHECK_EQUAL(elem2.use_count(), 1); // the stack dropped its reference
+        elem2.reset();                           // the last reference goes here
+        BOOST_CHECK_EQUAL(elem2.use_count(), 0);
     }
     {
         // OP_NIP erases a pointer without pushing anything.
         ScriptStackElem elem1 = MakeStackElem(std::vector<unsigned char>(vch1));
         const ScriptStackElem elem2 = MakeStackElem(std::vector<unsigned char>(vch2));
-        std::weak_ptr<const std::vector<unsigned char>> weak{elem1};
         std::vector<ScriptStackElem> stack;
         stack.push_back(elem1);
         stack.push_back(elem2);
@@ -1277,19 +1274,19 @@ BOOST_AUTO_TEST_CASE(eval_script_stack_aliasing)
         BOOST_CHECK(stack[0].get() == elem2.get());
         BOOST_CHECK_EQUAL(elem2.use_count(), 2);
         BOOST_CHECK_EQUAL(elem1.use_count(), 1); // only the test handle is left
-        BOOST_CHECK(!weak.expired());
-        elem1.reset();
-        BOOST_CHECK(weak.expired());
+        elem1.reset();                           // the last reference goes here
+        BOOST_CHECK_EQUAL(elem1.use_count(), 0);
     }
     {
         // OP_DROP releases an element the interpreter pushed itself.
         std::vector<ScriptStackElem> stack;
         BOOST_CHECK(EvalOn(stack, CScript() << vch1));
         BOOST_REQUIRE(stack.size() == 1);
-        std::weak_ptr<const std::vector<unsigned char>> weak{stack[0]};
+        const ScriptStackElem elem{stack[0]};
+        BOOST_CHECK_EQUAL(elem.use_count(), 2); // the test handle plus the stack slot
         BOOST_CHECK(EvalOn(stack, CScript() << OP_DROP));
         BOOST_CHECK(stack.empty());
-        BOOST_CHECK(weak.expired()); // nothing outside the stack ever owned it
+        BOOST_CHECK_EQUAL(elem.use_count(), 1); // the stack released its reference
     }
 }
 

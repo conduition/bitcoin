@@ -11,12 +11,14 @@
 #include <prevector.h>
 #include <pubkey.h>
 #include <script/script.h>
+#include <script/stack_elem.h>
 #include <serialize.h>
 #include <span.h>
 #include <tinyformat.h>
 #include <uint256.h>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <compare>
 #include <cstring>
@@ -41,9 +43,15 @@ inline bool set_error(ScriptError* ret, const ScriptError serror)
     return false;
 }
 
+/** The stack elements pushed by OP_1NEGATE and OP_1..OP_16, as CScriptNum would serialize them: each is a
+ *  single byte. Index 0 is OP_1NEGATE's encoding, indices 1..16 are OP_1..OP_16's. */
+constexpr std::array<uint8_t, 17>
+    SMALL_NUM_BYTES{0x81, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+                    0x0e, 0x0f, 0x10};
+
 } // namespace
 
-bool CastToBool(const valtype& vch)
+bool CastToBool(std::span<const uint8_t> vch)
 {
     for (unsigned int i = 0; i < vch.size(); i++)
     {
@@ -58,14 +66,12 @@ bool CastToBool(const valtype& vch)
     return false;
 }
 
-ScriptStackElem MakeStackElem(std::vector<unsigned char>&& v) { return std::make_shared<const valtype>(std::move(v)); }
-
 /**
  * Script is a stack machine (like Forth) that evaluates a predicate
  * returning a bool indicating valid or not.  There are no loops.
  */
 #define stackelem(i) (stack.at(size_t(int64_t(stack.size()) + int64_t{i})))
-#define stacktop(i) (*stackelem(i))
+#define stacktop(i) (stackelem(i)->bytes())
 #define altstackelem(i) (altstack.at(size_t(int64_t(altstack.size()) + int64_t{i})))
 static inline void popstack(std::vector<ScriptStackElem>& stack)
 {
@@ -329,9 +335,9 @@ public:
         }
     }
 };
-}
+} // namespace
 
-static bool EvalChecksigPreTapscript(const valtype& vchSig, const valtype& vchPubKey, CScript::const_iterator pbegincodehash, CScript::const_iterator pend, script_verify_flags flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* serror, bool& fSuccess)
+static bool EvalChecksigPreTapscript(std::span<const uint8_t> vchSig, std::span<const uint8_t> vchPubKey, CScript::const_iterator pbegincodehash, CScript::const_iterator pend, script_verify_flags flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* serror, bool& fSuccess)
 {
     assert(sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0);
 
@@ -345,11 +351,15 @@ static bool EvalChecksigPreTapscript(const valtype& vchSig, const valtype& vchPu
             return set_error(serror, SCRIPT_ERR_SIG_FINDANDDELETE);
     }
 
-    if (!CheckSignatureEncoding(vchSig, flags, serror) || !CheckPubKeyEncoding(vchPubKey, flags, sigversion, serror)) {
+    // The signature and pubkey encoding checks and the ECDSA checker itself take std::vector, so they get
+    // copies of the stack elements.
+    const valtype sig{vchSig.begin(), vchSig.end()};
+    const valtype pubkey{vchPubKey.begin(), vchPubKey.end()};
+    if (!CheckSignatureEncoding(sig, flags, serror) || !CheckPubKeyEncoding(pubkey, flags, sigversion, serror)) {
         //serror is set
         return false;
     }
-    fSuccess = checker.CheckECDSASignature(vchSig, vchPubKey, scriptCode, sigversion);
+    fSuccess = checker.CheckECDSASignature(sig, pubkey, scriptCode, sigversion);
 
     if (!fSuccess && (flags & SCRIPT_VERIFY_NULLFAIL) && vchSig.size())
         return set_error(serror, SCRIPT_ERR_SIG_NULLFAIL);
@@ -357,7 +367,7 @@ static bool EvalChecksigPreTapscript(const valtype& vchSig, const valtype& vchPu
     return true;
 }
 
-static bool EvalChecksigTapscript(const valtype& sig, const valtype& pubkey, ScriptExecutionData& execdata, script_verify_flags flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* serror, bool& success)
+static bool EvalChecksigTapscript(std::span<const uint8_t> sig, std::span<const uint8_t> pubkey, ScriptExecutionData& execdata, script_verify_flags flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* serror, bool& success)
 {
     assert(sigversion == SigVersion::TAPSCRIPT);
 
@@ -402,7 +412,7 @@ static bool EvalChecksigTapscript(const valtype& sig, const valtype& pubkey, Scr
  * A return value of false means the script fails entirely. When true is returned, the
  * success variable indicates whether the signature check itself succeeded.
  */
-static bool EvalChecksig(const valtype& sig, const valtype& pubkey, CScript::const_iterator pbegincodehash, CScript::const_iterator pend, ScriptExecutionData& execdata, script_verify_flags flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* serror, bool& success)
+static bool EvalChecksig(std::span<const uint8_t> sig, std::span<const uint8_t> pubkey, CScript::const_iterator pbegincodehash, CScript::const_iterator pend, ScriptExecutionData& execdata, script_verify_flags flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* serror, bool& success)
 {
     switch (sigversion) {
     case SigVersion::BASE:
@@ -429,8 +439,8 @@ bool EvalScript(std::vector<ScriptStackElem>& stack, const CScript& script, scri
     // static const valtype vchZero(0);
 
     // Execution locals; statics would cause cross-thread contention
-    const ScriptStackElem elemFalse = MakeStackElem(valtype(0));
-    const ScriptStackElem elemTrue = MakeStackElem(valtype(1, 1));
+    const ScriptStackElem elemFalse = MakeStackElem(std::span<const uint8_t>{});
+    const ScriptStackElem elemTrue = MakeStackElem(std::span<const uint8_t>{&SMALL_NUM_BYTES[1], 1});
 
     // sigversion cannot be TAPROOT here, as it admits no script execution.
     assert(sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0 || sigversion == SigVersion::TAPSCRIPT);
@@ -497,7 +507,11 @@ bool EvalScript(std::vector<ScriptStackElem>& stack, const CScript& script, scri
                 if (fRequireMinimal && !CheckMinimalPush(vchPushValue, opcode)) {
                     return set_error(serror, SCRIPT_ERR_MINIMALDATA);
                 }
-                stack.push_back(MakeStackElem(std::move(vchPushValue)));
+                if (vchPushValue.empty()) {
+                    stack.push_back(elemFalse);
+                } else {
+                    stack.push_back(MakeStackElem(std::move(vchPushValue)));
+                }
             } else if (fExec || (OP_IF <= opcode && opcode <= OP_ENDIF))
             switch (opcode)
             {
@@ -523,8 +537,8 @@ bool EvalScript(std::vector<ScriptStackElem>& stack, const CScript& script, scri
                 case OP_16:
                 {
                     // ( -- value)
-                    CScriptNum bn((int)opcode - (int)(OP_1 - 1));
-                    stack.push_back(MakeStackElem(bn.getvch()));
+                    const size_t small_num = (opcode == OP_1NEGATE) ? 0 : size_t(opcode) - size_t(OP_1) + 1;
+                    stack.push_back(MakeStackElem(std::span<const uint8_t>{&SMALL_NUM_BYTES[small_num], 1}));
                     // The result of these opcodes should always be the minimal way to push the data
                     // they push, so no need for a CheckMinimalPush here.
                 }
@@ -627,7 +641,7 @@ bool EvalScript(std::vector<ScriptStackElem>& stack, const CScript& script, scri
                     {
                         if (stack.size() < 1)
                             return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
-                        const valtype& vch = stacktop(-1);
+                        const auto vch = stacktop(-1);
                         // Tapscript requires minimal IF/NOTIF inputs as a consensus rule.
                         if (sigversion == SigVersion::TAPSCRIPT) {
                             // The input argument to the OP_IF and OP_NOTIF opcodes must be either
@@ -776,8 +790,8 @@ bool EvalScript(std::vector<ScriptStackElem>& stack, const CScript& script, scri
                     // (x1 x2 x3 x4 -- x3 x4 x1 x2)
                     if (stack.size() < 4)
                         return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
-                    swap(stackelem(-4), stackelem(-2));
-                    swap(stackelem(-3), stackelem(-1));
+                    std::swap(stackelem(-4), stackelem(-2));
+                    std::swap(stackelem(-3), stackelem(-1));
                 }
                 break;
 
@@ -786,8 +800,8 @@ bool EvalScript(std::vector<ScriptStackElem>& stack, const CScript& script, scri
                     // (x - 0 | x x)
                     if (stack.size() < 1)
                         return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
-                    ScriptStackElem elem = stackelem(-1);
-                    if (CastToBool(*elem))
+                    const ScriptStackElem elem = stackelem(-1);
+                    if (CastToBool(elem->bytes()))
                         stack.push_back(elem);
                 }
                 break;
@@ -863,8 +877,8 @@ bool EvalScript(std::vector<ScriptStackElem>& stack, const CScript& script, scri
                     //  x2 x3 x1  after second swap
                     if (stack.size() < 3)
                         return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
-                    swap(stackelem(-3), stackelem(-2));
-                    swap(stackelem(-2), stackelem(-1));
+                    std::swap(stackelem(-3), stackelem(-2));
+                    std::swap(stackelem(-2), stackelem(-1));
                 }
                 break;
 
@@ -873,7 +887,7 @@ bool EvalScript(std::vector<ScriptStackElem>& stack, const CScript& script, scri
                     // (x1 x2 -- x2 x1)
                     if (stack.size() < 2)
                         return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
-                    swap(stackelem(-2), stackelem(-1));
+                    std::swap(stackelem(-2), stackelem(-1));
                 }
                 break;
 
@@ -909,9 +923,9 @@ bool EvalScript(std::vector<ScriptStackElem>& stack, const CScript& script, scri
                     // (x1 x2 - bool)
                     if (stack.size() < 2)
                         return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
-                    const valtype& vch1 = stacktop(-2);
-                    const valtype& vch2 = stacktop(-1);
-                    bool fEqual = (vch1 == vch2);
+                    const auto vch1 = stacktop(-2);
+                    const auto vch2 = stacktop(-1);
+                    bool fEqual = vch1.size() == vch2.size() && std::equal(vch1.begin(), vch1.end(), vch2.begin());
                     // OP_NOTEQUAL is disabled because it would be too easy to say
                     // something like n != 1 and have some wiseguy pass in 1 with extra
                     // zero bytes after it (numerically, 0x01 == 0x0001 == 0x000001)
@@ -1046,7 +1060,7 @@ bool EvalScript(std::vector<ScriptStackElem>& stack, const CScript& script, scri
                     // (in -- hash)
                     if (stack.size() < 1)
                         return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
-                    const valtype& vch = stacktop(-1);
+                    const auto vch = stacktop(-1);
                     valtype vchHash((opcode == OP_RIPEMD160 || opcode == OP_SHA1 || opcode == OP_HASH160) ? 20 : 32);
                     if (opcode == OP_RIPEMD160)
                         CRIPEMD160().Write(vch.data(), vch.size()).Finalize(vchHash.data());
@@ -1081,8 +1095,8 @@ bool EvalScript(std::vector<ScriptStackElem>& stack, const CScript& script, scri
                     if (stack.size() < 2)
                         return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
 
-                    const valtype& vchSig = stacktop(-2);
-                    const valtype& vchPubKey = stacktop(-1);
+                    const auto vchSig = stacktop(-2);
+                    const auto vchPubKey = stacktop(-1);
 
                     bool fSuccess = true;
                     if (!EvalChecksig(vchSig, vchPubKey, pbegincodehash, pend, execdata, flags, checker, sigversion, serror, fSuccess)) return false;
@@ -1107,9 +1121,9 @@ bool EvalScript(std::vector<ScriptStackElem>& stack, const CScript& script, scri
                     // (sig num pubkey -- num)
                     if (stack.size() < 3) return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
 
-                    const valtype& sig = stacktop(-3);
+                    const auto sig = stacktop(-3);
                     const CScriptNum num(stacktop(-2), fRequireMinimal);
-                    const valtype& pubkey = stacktop(-1);
+                    const auto pubkey = stacktop(-1);
 
                     bool success = true;
                     if (!EvalChecksig(sig, pubkey, pbegincodehash, pend, execdata, flags, checker, sigversion, serror, success)) return false;
@@ -1159,7 +1173,7 @@ bool EvalScript(std::vector<ScriptStackElem>& stack, const CScript& script, scri
                     // Drop the signature in pre-segwit scripts but not segwit scripts
                     for (int k = 0; k < nSigsCount; k++)
                     {
-                        const valtype& vchSig = stacktop(-isig - k);
+                        const auto vchSig = stacktop(-isig - k);
                         if (sigversion == SigVersion::BASE) {
                             int found = FindAndDelete(scriptCode, CScript() << vchSig);
                             if (found > 0 && (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE))
@@ -1170,19 +1184,23 @@ bool EvalScript(std::vector<ScriptStackElem>& stack, const CScript& script, scri
                     bool fSuccess = true;
                     while (fSuccess && nSigsCount > 0)
                     {
-                        const valtype& vchSig = stacktop(-isig);
-                        const valtype& vchPubKey = stacktop(-ikey);
+                        const auto vchSig = stacktop(-isig);
+                        const auto vchPubKey = stacktop(-ikey);
+                        // The signature and pubkey encoding checks and the ECDSA checker itself take
+                        // std::vector, so they get a copy of the stack elements.
+                        const valtype sig{vchSig.begin(), vchSig.end()};
+                        const valtype pubkey{vchPubKey.begin(), vchPubKey.end()};
 
                         // Note how this makes the exact order of pubkey/signature evaluation
                         // distinguishable by CHECKMULTISIG NOT if the STRICTENC flag is set.
                         // See the script_(in)valid tests for details.
-                        if (!CheckSignatureEncoding(vchSig, flags, serror) || !CheckPubKeyEncoding(vchPubKey, flags, sigversion, serror)) {
+                        if (!CheckSignatureEncoding(sig, flags, serror) || !CheckPubKeyEncoding(pubkey, flags, sigversion, serror)) {
                             // serror is set
                             return false;
                         }
 
                         // Check signature
-                        bool fOk = checker.CheckECDSASignature(vchSig, vchPubKey, scriptCode, sigversion);
+                        bool fOk = checker.CheckECDSASignature(sig, pubkey, scriptCode, sigversion);
 
                         if (fOk) {
                             isig++;
@@ -1873,7 +1891,7 @@ static bool ExecuteWitnessScript(const std::span<const valtype>& stack_span, con
     std::vector<ScriptStackElem> stack;
     stack.reserve(stack_span.size());
     for (const valtype& bytes : stack_span) {
-        stack.push_back(MakeStackElem(valtype(bytes)));
+        stack.push_back(MakeStackElem(bytes));
     }
 
     // Run the script interpreter.
@@ -1881,7 +1899,7 @@ static bool ExecuteWitnessScript(const std::span<const valtype>& stack_span, con
 
     // Scripts inside witness implicitly require cleanstack behaviour
     if (stack.size() != 1) return set_error(serror, SCRIPT_ERR_CLEANSTACK);
-    if (!CastToBool(*stack.back())) return set_error(serror, SCRIPT_ERR_EVAL_FALSE);
+    if (!CastToBool(stack.back()->bytes())) return set_error(serror, SCRIPT_ERR_EVAL_FALSE);
     return true;
 }
 
@@ -2042,7 +2060,7 @@ bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const C
         return false;
     if (stack.empty())
         return set_error(serror, SCRIPT_ERR_EVAL_FALSE);
-    if (CastToBool(*stack.back()) == false)
+    if (CastToBool(stack.back()->bytes()) == false)
         return set_error(serror, SCRIPT_ERR_EVAL_FALSE);
 
     // Bare witness programs
@@ -2079,8 +2097,8 @@ bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const C
         // an empty stack and the EvalScript above would return false.
         assert(!stack.empty());
 
-        const valtype& pubKeySerialized = *stack.back();
-        CScript pubKey2(pubKeySerialized.begin(), pubKeySerialized.end());
+        const auto pubKeySerialized = stack.back()->bytes();
+        CScript pubKey2{pubKeySerialized.begin(), pubKeySerialized.end()};
         popstack(stack);
 
         if (!EvalScript(stack, pubKey2, flags, checker, SigVersion::BASE, nullptr, serror))
@@ -2088,7 +2106,7 @@ bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const C
             return false;
         if (stack.empty())
             return set_error(serror, SCRIPT_ERR_EVAL_FALSE);
-        if (!CastToBool(*stack.back()))
+        if (!CastToBool(stack.back()->bytes()))
             return set_error(serror, SCRIPT_ERR_EVAL_FALSE);
 
         // P2SH witness program

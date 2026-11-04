@@ -485,7 +485,7 @@ static CScript PushAll(const std::vector<ScriptStackElem>& values)
     std::vector<valtype> stack;
     stack.reserve(values.size());
     for (const ScriptStackElem& elem : values) {
-        stack.push_back(*elem);
+        stack.emplace_back(elem->begin(), elem->end());
     }
     return PushAll(stack);
 }

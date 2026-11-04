@@ -852,7 +852,7 @@ struct Stacks
     explicit Stacks(const SignatureData& data)
     {
         for (const valtype& elem : data.scriptWitness.stack) {
-            witness.push_back(MakeStackElem(valtype(elem)));
+            witness.push_back(MakeStackElem(elem));
         }
         EvalScript(script, data.scriptSig, SCRIPT_VERIFY_STRICTENC, BaseSignatureChecker(), SigVersion::BASE);
     }
@@ -914,7 +914,9 @@ SignatureData DataFromTransaction(const CMutableTransaction& tx, unsigned int nI
             for (unsigned int i = last_success_key; i < num_pubkeys; ++i) {
                 const valtype& pubkey = solutions[i+1];
                 // We either have a signature for this pubkey, or we have found a signature and it is valid
-                if (data.signatures.contains(CPubKey(pubkey).GetID()) || extractor_checker.CheckECDSASignature(*sig, pubkey, next_script, sigversion)) {
+                const valtype sig_bytes{sig->begin(), sig->end()};
+                if (data.signatures.contains(CPubKey(pubkey).GetID()) ||
+                    extractor_checker.CheckECDSASignature(sig_bytes, pubkey, next_script, sigversion)) {
                     last_success_key = i + 1;
                     break;
                 }
