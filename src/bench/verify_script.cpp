@@ -7,6 +7,7 @@
 #include <coins.h>
 #include <key.h>
 #include <policy/policy.h>
+#include <prevector.h>
 #include <primitives/transaction.h>
 #include <pubkey.h>
 #include <script/interpreter.h>
@@ -22,6 +23,7 @@
 #include <util/translation.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <map>
 #include <span>
 #include <vector>
